@@ -43,6 +43,8 @@ $(SBOM_STAMP): $(SYSROOT_COMPLETE_STAMP)
 	             echo "  WARNING: SBOM tool provisioning failed; SBOM will be degraded (NOASSERTION licenses, CycloneDX only)" ; } ; \
 	     python3 $(SCRIPTDIR)/gen-sbom.py \
 	         --machine $(MACHINE) \
+	         --make-var MACHINEROOT=$(MACHINEROOT) \
+	         $(if $(MACHINE_REV),--make-var MACHINE_REV=$(MACHINE_REV)) \
 	         --output $(SBOM_CDX) \
 	         --spdx-output $(SBOM_SPDX)
 	$(Q) touch $@

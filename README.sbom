@@ -27,8 +27,49 @@ not present in the shipped image.
 
 For each component the SBOM records the name, the exact version actually built,
 the upstream (canonical, non-mirror) source URL, the source tarball's SHA-256,
-the list of ONIE patches applied (as CycloneDX *pedigree*), and the SPDX
-license.
+the ONIE patches applied (as CycloneDX *pedigree*), and the SPDX license.
+
+Structure
+---------
+
+The document describes the image itself in ``metadata.component``: its
+release (``LSB_RELEASE_TAG``), the commit it was built from (as a
+``pkg:github/opencomputeproject/onie@<commit>`` package URL), and a
+timestamp taken from ``SOURCE_DATE_EPOCH`` or else that commit's date.  The
+``serialNumber`` is derived from the document's own contents, so two
+identical builds describe themselves identically.
+
+The ``dependencies`` graph is rooted at the image, and every component is
+reachable from it::
+
+    onie-<machine>
+    |-- linux                  (operating-system)
+    |-- shim, grub / u-boot    (firmware)
+    `-- onie-rootfs            (operating-system: the initramfs)
+        |-- busybox, dropbear, lvm2, openssl, uClibc-ng, ...
+        `-- each package -> the packages it is built against
+                              (e.g. dropbear -> zlib, lvm2 -> libaio)
+
+A package's dependencies are read from its make fragment: every
+``$(<PKG>_BUILD_STAMP)`` or ``$(<PKG>_INSTALL_STAMP)`` prerequisite naming
+another shipped package.  A consumer can therefore say not only that a
+library is vulnerable but which programs in the image are built on it.
+
+Patches
+-------
+
+``pedigree.patches[]`` lists every patch the build applies to a component,
+from the same series files the build reads: the package's own (in a
+version-specific directory for the kernel, grub and u-boot) and then the
+MACHINE's, including vendor-wide patches under ``machine/<vendor>/``.
+
+A patch that names a CVE in its filename, or in a ``Fixes:`` or ``Subject:``
+header, records it in ``pedigree.patches[].resolves[]``, so a consumer that
+reads pedigree treats that CVE as fixed in this image.  A CVE mentioned
+anywhere else in a patch is not taken as a claim to fix it.  To record a
+fix, name the CVE in the patch's subject, for example::
+
+    Subject: [PATCH] busybox: fix heap overflow in foo (CVE-2026-12345)
 
 Output
 ======

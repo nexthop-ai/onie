@@ -25,13 +25,23 @@
 # Per-component metadata comes from the .make variables (version, tarball,
 # source URL), the SHA-256 of the actual downloaded tarball (so the SBOM
 # attests the built artifact regardless of the repo's integrity-pin format),
-# the applied patch series (patches/<pkg>/series), and the SPDX license
+# the patch series the build applies (the package's own, version-specific
+# where it keeps them that way, and the MACHINE's), and the SPDX license
 # detected from the already-extracted source tree (askalono) with a curated
 # override map for the genuinely multi-license packages.
+#
+# The dependency graph is rooted at the image: the image holds the kernel,
+# the bootloader and the rootfs; the rootfs holds every userspace package;
+# and a package depends on each package its fragment builds against (a
+# $(<PKG>_BUILD_STAMP) or $(<PKG>_INSTALL_STAMP) prerequisite).  A patch that
+# names a CVE in its filename, or in a 'Fixes:' or 'Subject:' header, records
+# it in pedigree.patches[].resolves[]; a CVE mentioned anywhere else is not a
+# claim to fix it.
 
 import argparse
 import json
 import hashlib
+import uuid
 import os
 import re
 import shutil
@@ -57,6 +67,12 @@ BUILD_ONLY_PREFIXES = {
 }
 
 
+# NAME=VALUE pairs every make query passes on, so a MACHINE that lives
+# under a vendor directory (MACHINEROOT) or varies by MACHINE_REV resolves
+# exactly as the build that made the image did.
+MAKE_VARS = []
+
+
 def run(cmd, **kw):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
 
@@ -74,7 +90,7 @@ def make_dump(machine):
     # Drop parent make's jobserver env so this introspection sub-make is clean.
     env = {k: v for k, v in os.environ.items()
            if k not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
-    out = run(["make", "MACHINE=%s" % machine, "--eval=" + eval_expr,
+    out = run(["make", "MACHINE=%s" % machine] + MAKE_VARS + [ "--eval=" + eval_expr,
                "onie-sbom-dump"], cwd=BUILD_CONFIG, env=env).stdout
     pkgs = {}
     for line in out.splitlines():
@@ -139,23 +155,121 @@ def make_var(machine, var):
     """Resolve a single make variable's value for MACHINE."""
     env = {k: v for k, v in os.environ.items()
            if k not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
-    out = run(["make", "MACHINE=%s" % machine,
+    out = run(["make", "MACHINE=%s" % machine] + MAKE_VARS + [
                "--eval=onie-sbom-var: ; @echo $(%s)" % var,
                "onie-sbom-var"], cwd=BUILD_CONFIG, env=env).stdout
     return out.strip()
 
 
-def patches_for(fragment):
-    """Applied patch filenames from patches/<fragment>/series (pedigree)."""
-    series = os.path.join(PATCHDIR, fragment, "series")
-    if not os.path.isfile(series):
+def make_vars(machine, patterns):
+    """{name: value} for every make variable matching one of the % patterns."""
+    sep = "\x1f"
+    eval_expr = ("onie-sbom-vars: ; @$(foreach v,$(sort $(filter %s,$(.VARIABLES))),"
+                 "$(info $(v)%s$($(v))))" % (" ".join(patterns), sep))
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL")}
+    out = run(["make", "MACHINE=%s" % machine] + MAKE_VARS + [ "--eval=" + eval_expr,
+               "onie-sbom-vars"], cwd=BUILD_CONFIG, env=env).stdout
+    return dict(l.split(sep, 1) for l in out.splitlines() if sep in l)
+
+
+def series_entries(series):
+    """Patch names a series file lists, in order."""
+    if not series or not os.path.isfile(series):
         return []
-    pats = []
-    for line in open(series):
-        line = line.strip()
-        if line and not line.startswith("#"):
-            pats.append(line.split()[0])
-    return pats
+    out = []
+    for line in open(series, encoding="utf-8", errors="replace"):
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.append(line.split()[0])
+    return out
+
+
+_CVE = r"CVE-\d{4}-\d{4,7}"
+_FIXES_RE = re.compile(r"^\s*Fixes:\s*(%s)" % _CVE, re.I | re.M)
+_SUBJECT_RE = re.compile(r"^Subject:.*?(%s)" % _CVE, re.I | re.M)
+
+
+def cves_fixed(name, path):
+    """CVEs a patch declares it fixes: in its filename, or in a 'Fixes:' or
+    'Subject:' header.  The same rule SONiC's SBOM applies -- a CVE named
+    anywhere else in a patch is often a passing reference, not a claim."""
+    found = set(m.upper() for m in re.findall(_CVE, name, re.I))
+    if path and os.path.isfile(path):
+        text = open(path, encoding="utf-8", errors="replace").read(65536)
+        end = min([i for i in (text.find("\n---\n"), text.find("\ndiff --git"))
+                   if i >= 0] or [4000])
+        head = text[:end]
+        found |= set(m.upper() for m in _FIXES_RE.findall(head))
+        found |= set(m.upper() for m in _SUBJECT_RE.findall(head))
+    return sorted(found)
+
+
+def patch_series(fragment, patchvars, machinevars):
+    """The series the build applies to a package, base first, then MACHINE:
+    [(series file, directory a patch is otherwise looked up in)].
+
+    The package's own series is where its fragment says (<X>_SRCPATCHDIR,
+    plus u-boot's <X>_CMNPATCHDIR), which is version-specific for the kernel,
+    grub and u-boot.  The MACHINE's is MACHINE_<X>_PATCHDIR (u-boot hard-codes
+    $(MACHINEDIR)/u-boot); its entries may live in the vendor-wide
+    $(MACHINEROOT)/<pkg> directory, as cp-machine-patches resolves them."""
+    out = []
+    path = os.path.join(MAKEDIR, fragment + ".make")
+    if not os.path.isfile(path):
+        return out
+    text = open(path, encoding="utf-8", errors="replace").read()
+    for kind in ("CMNPATCHDIR", "SRCPATCHDIR"):
+        for var in re.findall(r"^([A-Z0-9_]+_%s)\b" % kind, text, re.M):
+            d = patchvars.get(var, "")
+            if d:
+                out.append((os.path.join(d, "series"), ""))
+    mdirs = [patchvars.get(v, "") for v in
+             re.findall(r"^(MACHINE_[A-Z0-9_]+_PATCHDIR)\b", text, re.M)]
+    if fragment == "u-boot" and machinevars.get("MACHINEDIR"):
+        mdirs.append(os.path.join(machinevars["MACHINEDIR"], "u-boot"))
+    vendor = os.path.join(machinevars.get("MACHINEROOT", ""), fragment)
+    for d in mdirs:
+        if d:
+            out.append((os.path.join(d, "series"), vendor))
+    return out
+
+
+def pedigree_patches(fragment, patchvars, machinevars):
+    """CycloneDX pedigree.patches[] for every patch the build applies."""
+    patches = []
+    for series, fallback in patch_series(fragment, patchvars, machinevars):
+        sdir = os.path.dirname(series)
+        for name in series_entries(series):
+            path = os.path.join(sdir, name)
+            if not os.path.isfile(path) and fallback:
+                path = os.path.join(fallback, name)
+            rel = os.path.relpath(path, ONIE_ROOT) if os.path.isfile(path) else name
+            patch = {"type": "unofficial", "diff": {"url": rel}}
+            fixes = cves_fixed(name, path)
+            if fixes:
+                patch["resolves"] = [{"type": "security", "id": c,
+                                      "source": {"name": "NVD",
+                                                 "url": "https://nvd.nist.gov/vuln/detail/" + c}}
+                                     for c in fixes]
+            patches.append(patch)
+    return patches
+
+
+# Prerequisites that order an install rather than state a dependency:
+# e2fsprogs installs after busybox so its tools replace busybox's applets,
+# and nothing links against busybox.
+ORDER_ONLY = {"BUSYBOX"}
+
+
+def fragment_deps(fragment):
+    """Package prefixes a fragment builds against: the $(<PKG>_BUILD_STAMP)
+    and $(<PKG>_INSTALL_STAMP) prerequisites it names."""
+    path = os.path.join(MAKEDIR, fragment + ".make")
+    if not os.path.isfile(path):
+        return set()
+    text = open(path, encoding="utf-8", errors="replace").read()
+    return set(re.findall(r"\$\(([A-Z0-9_]+)_(?:BUILD|INSTALL)_STAMP\)", text)) - ORDER_ONLY
 
 
 def detect_license(fragment, srcdir, overrides):
@@ -254,12 +368,40 @@ def cpe_for(name, version, overrides):
         part, vendor, product, cpe_version(version))
 
 
+def git_revision():
+    """The commit the tree was built from, or None outside a checkout."""
+    try:
+        return run(["git", "rev-parse", "HEAD"], cwd=ONIE_ROOT).stdout.strip() or None
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def build_timestamp():
+    """When the image's sources were made, so a rebuild is not a new date:
+    SOURCE_DATE_EPOCH if set, else the commit's date, else now."""
+    import datetime
+    sde = os.environ.get("SOURCE_DATE_EPOCH")
+    if sde and sde.isdigit():
+        t = datetime.datetime.fromtimestamp(int(sde), datetime.timezone.utc)
+    else:
+        try:
+            t = datetime.datetime.fromtimestamp(int(run(
+                ["git", "log", "-1", "--format=%ct"], cwd=ONIE_ROOT).stdout.strip()),
+                datetime.timezone.utc)
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            t = datetime.datetime.now(datetime.timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate an ONIE image SBOM (CycloneDX 1.6)")
     ap.add_argument("--machine", required=True)
     ap.add_argument("--output", required=True, help="output CycloneDX 1.6 JSON path")
     ap.add_argument("--spdx-output", help="also emit SPDX 2.3 JSON here (cyclonedx-cli)")
+    ap.add_argument("--make-var", action="append", default=[], metavar="NAME=VALUE",
+                    help="pass to every make query, e.g. MACHINEROOT=../machine/<vendor>")
     args = ap.parse_args()
+    MAKE_VARS.extend(args.make_var)
 
     overrides = {}
     if os.path.isfile(OVERRIDES):
@@ -273,18 +415,26 @@ def main():
     enabled = make_dump(args.machine)
     shipped_pref = shipped_fragment_prefixes()
     downloaddir = make_var(args.machine, "DOWNLOADDIR")
+    patchvars = make_vars(args.machine, ["%_SRCPATCHDIR", "%_CMNPATCHDIR",
+                                         "MACHINE_%_PATCHDIR"])
+    machinevars = make_vars(args.machine, ["MACHINEDIR", "MACHINEROOT",
+                                           "LSB_RELEASE_TAG"])
 
     components = []
     warnings = []
+    by_prefix = {}           # make prefix -> component
+    parent_of = {}           # bom-ref -> "kernel" | "boot" | "rootfs"
 
-    def add(prefix, fragment, name, version, tarball, url):
+    def add(prefix, fragment, name, version, tarball, url,
+            ctype="library", place="rootfs"):
         sha = sha256_for(tarball, downloaddir) if tarball else None
         src = canonical_source_url(url, tarball)
         lic, how = detect_license(fragment, enabled.get(prefix, {}).get("dir", ""), overrides)
         if lic == "NOASSERTION":
             warnings.append("license undetermined: %s" % name)
         comp = {
-            "type": "library",
+            "type": ctype,
+            "bom-ref": "%s@%s" % (name, version),
             "name": name,
             "version": version,
             "purl": purl(name, version, src, sha),
@@ -298,12 +448,12 @@ def main():
             if sha:
                 ext["hashes"] = [{"alg": "SHA-256", "content": sha}]
             comp["externalReferences"] = [ext]
-        pats = patches_for(fragment)
+        pats = pedigree_patches(fragment, patchvars, machinevars)
         if pats:
-            comp["pedigree"] = {"patches": [{"type": "unofficial",
-                                "diff": {"url": "patches/%s/%s" % (fragment, p)}}
-                                for p in pats]}
+            comp["pedigree"] = {"patches": pats}
         components.append(comp)
+        by_prefix[prefix] = comp
+        parent_of[comp["bom-ref"]] = place
 
     # 1) shipped rootfs packages = enabled prefixes that install to SYSROOTDIR
     for prefix, frag in sorted(shipped_pref.items()):
@@ -316,7 +466,8 @@ def main():
         # kernel: tarball encodes LINUX_RELEASE (e.g. linux-6.18.34.tar.xz)
         t = enabled["LINUX"]["tarball"]
         ver = re.sub(r"^linux-|\.tar\..*$", "", t) or enabled["LINUX"]["version"]
-        add("LINUX", "kernel", "linux", ver, t, enabled["LINUX"]["url"])
+        add("LINUX", "kernel", "linux", ver, t, enabled["LINUX"]["url"],
+            ctype="operating-system", place="image")
     if "XTOOLS_LIBC" in enabled:
         v = enabled["XTOOLS_LIBC"]["version"]
         add("XTOOLS_LIBC", "uclibc-ng", "uClibc-ng", v,
@@ -327,21 +478,63 @@ def main():
         if boot in enabled and enabled[boot]["tarball"]:
             e = enabled[boot]
             frag = "shim" if boot == "SHIM" else "u-boot"
-            add(boot, frag, frag, e["version"], e["tarball"], e["url"])
+            add(boot, frag, frag, e["version"], e["tarball"], e["url"],
+                ctype="firmware", place="image")
+    # grub installs its tools into the rootfs, but what it is in the image is
+    # the bootloader.
+    if "grub@%s" % enabled.get("GRUB", {}).get("version") in parent_of:
+        g = by_prefix["GRUB"]
+        g["type"] = "firmware"
+        parent_of[g["bom-ref"]] = "image"
+
+    # The image, and the rootfs (initramfs) it boots into.
+    release = machinevars.get("LSB_RELEASE_TAG", "")
+    root = {"type": "operating-system", "bom-ref": "onie-%s" % args.machine,
+            "name": "onie-%s" % args.machine}
+    if release:
+        root["version"] = release
+    rev = git_revision()
+    if rev:
+        root["purl"] = "pkg:github/opencomputeproject/onie@%s" % rev
+    rootfs = {"type": "operating-system", "bom-ref": "onie-rootfs",
+              "name": "onie-rootfs",
+              "description": "The ONIE initramfs root filesystem"}
+    if release:
+        rootfs["version"] = release
+
+    # Containment: image -> kernel, bootloader, rootfs; rootfs -> userspace.
+    # Use: a package -> each package its fragment builds against.
+    edges = {root["bom-ref"]: set(), rootfs["bom-ref"]: set()}
+    for c in components:
+        edges[c["bom-ref"]] = set()
+        top = root["bom-ref"] if parent_of[c["bom-ref"]] == "image" else rootfs["bom-ref"]
+        edges[top].add(c["bom-ref"])
+    edges[root["bom-ref"]].add(rootfs["bom-ref"])
+    for prefix, comp in by_prefix.items():
+        frag = next((c["value"] for c in comp["properties"]
+                     if c["name"] == "onie:fragment"), "")
+        for dep in fragment_deps(frag):
+            if dep != prefix and dep in by_prefix:
+                edges[comp["bom-ref"]].add(by_prefix[dep]["bom-ref"])
 
     sbom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
         "version": 1,
         "metadata": {
-            "component": {
-                "type": "operating-system",
-                "name": "onie-%s" % args.machine,
-            },
+            "timestamp": build_timestamp(),
+            "component": root,
             "tools": [{"name": "gen-sbom.py", "vendor": "ONIE"}],
         },
-        "components": sorted(components, key=lambda c: c["name"]),
+        "components": [rootfs] + sorted(components, key=lambda c: c["name"]),
+        "dependencies": [{"ref": r, "dependsOn": sorted(d)}
+                         for r, d in sorted(edges.items())],
     }
+    # A serial derived from the contents: identical builds describe
+    # themselves identically.
+    body = json.dumps(sbom, sort_keys=True).encode()
+    sbom["serialNumber"] = "urn:uuid:%s" % uuid.uuid5(
+        uuid.NAMESPACE_URL, "onie-sbom:" + hashlib.sha256(body).hexdigest())
     with open(args.output, "w") as f:
         json.dump(sbom, f, indent=2)
         f.write("\n")
