@@ -267,6 +267,18 @@ jobs:
             [ -f "$f" ] || continue
             cat "$f" >> "$GITHUB_STEP_SUMMARY"
           done
+
+      # The image's CycloneDX SBOM (written by `make all`), so it can be
+      # fetched from the run.  A missing SBOM fails the step rather than
+      # silently uploading nothing.
+      - name: Upload CycloneDX SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: onie-kvm-sbom-cyclonedx
+          path: build/images/kvm_x86_64-r0.sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload kvm recovery image
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
