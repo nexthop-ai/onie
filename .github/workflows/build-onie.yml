@@ -6,20 +6,22 @@ name: Build ONIE (kvm_x86_64)
 # with secure boot enabled: the workflow generates demonstration signing
 # keys and self-signs the shim before building.
 
-# Run on every push and pull request: the point of this workflow is to
-# confirm the change still builds, and the kvm_x86_64 image depends on far
-# more than the build files (installer/, rootconf/, patches/, ...), so path
-# filtering would risk skipping validation on build-affecting changes.
+# Run on every pull request and on pushes to master: the point of this
+# workflow is to confirm the change still builds, and the kvm_x86_64 image
+# depends on far more than the build files (installer/, rootconf/, patches/,
+# ...), so path filtering would risk skipping validation on build-affecting
+# changes.
 #
-# A push to a branch that already has an open pull request IN THIS repository
-# fires both events and ran the whole pipeline twice; the concurrency group
-# below cannot collapse them, because the two events carry different refs
-# (refs/heads/<branch> vs refs/pull/<n>/merge).  The "gate" job below drops the
-# duplicate push run.  See the comment there for why this is a query rather
-# than a branch filter on "push:".
+# "push" is limited to master so a branch with an open pull request does not
+# build twice: a push to it would fire both events, and the two runs carry
+# different refs (refs/heads/<branch> vs refs/pull/<n>/merge), so the
+# concurrency group below cannot collapse them.  A branch without a pull
+# request gets no automatic run; start one from the Actions tab
+# (workflow_dispatch) when needed.
 on:
   workflow_dispatch:
   push:
+    branches: [master]
   pull_request:
 
 # Cancel an in-progress run when a newer commit is pushed to the same ref, so
@@ -35,65 +37,8 @@ permissions:
   contents: read
 
 jobs:
-  # Skip a push-triggered run when an open pull request in this repository
-  # already covers the commit -- the pull_request run is the one that reports
-  # on the PR, so the push run is pure duplicate cost.
-  #
-  # Deliberately a query rather than restricting "push:" to the long-lived
-  # branches.  A branch filter also removes CI from every topic branch in a
-  # FORK, and that is where this workflow does most of its pre-submit work: a
-  # fork's pull requests are opened against the upstream repository, so they
-  # raise no pull_request event in the fork, and workflow_dispatch is not
-  # available there either unless the workflow is also on the fork's default
-  # branch.  A branch filter would leave such a branch with no CI at all.  The
-  # query has no such blind spot: in a fork it simply finds no pull request and
-  # the push run proceeds.
-  #
-  # Only "build" needs to depend on this -- the other jobs chain from it, and a
-  # skipped job skips its dependents.
-  gate:
-    name: Check for a duplicate run
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    # Job-level permissions replace the workflow-level block rather than adding
-    # to it; this job reads pull requests and checks out nothing.
-    permissions:
-      pull-requests: read
-    outputs:
-      run: ${{ steps.check.outputs.run }}
-    steps:
-      - name: Decide whether this run is needed
-        id: check
-        # Everything from the event context is passed via env rather than
-        # interpolated into the script body, so a branch name can never be
-        # parsed as shell.
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          REPO: ${{ github.repository }}
-          OWNER: ${{ github.repository_owner }}
-          BRANCH: ${{ github.ref_name }}
-        run: |
-          if [ "$EVENT" != push ]; then
-            echo "$EVENT is not a push; running."
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          open="$(gh api --method GET "repos/$REPO/pulls" \
-                    -f state=open -f head="$OWNER:$BRANCH" --jq 'length')"
-          if [ "${open:-0}" -gt 0 ]; then
-            echo "An open pull request in $REPO already covers $BRANCH;" \
-                 "its pull_request run reports on it.  Skipping the push run."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "No open pull request in $REPO for $BRANCH; running."
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
   build:
     name: Build kvm_x86_64
-    needs: gate
-    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     # A cold build (toolchain + full image) is roughly 45-60 min; cap it so a
     # wedged build fails here instead of burning the 6-hour GitHub default.
