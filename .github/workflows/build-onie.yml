@@ -23,6 +23,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  # A merge-queue entry is a different event from its pull request; without
+  # this the PR workflow's "Merge Status" check would find no build to wait
+  # for there and pass.
+  merge_group:
 
 # Cancel an in-progress run when a newer commit is pushed to the same ref, so
 # stacked pushes don't pile up concurrent builds.  Runs on master are never
