@@ -1,0 +1,57 @@
+name: PR
+
+# One check to require, rather than a list somebody maintains.
+#
+# This job waits for every other check on the commit to pass or be skipped, so
+# it is the only status check the master ruleset names.  A workflow added later
+# is gated automatically: it reports a check on the same event, this waits for
+# it, and nothing has to be added to the ruleset for it to count.
+#
+# That only covers workflows that fire on the same event.  A workflow that
+# does not declare an event reports no check there, and this job cannot tell a
+# check that will never run from one that has not started yet, so every
+# workflow meant to gate a merge declares "merge_group:" alongside
+# "pull_request:".
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  merge-status:
+    name: Merge Status
+    runs-on: ubuntu-latest
+    # GitHub-hosted jobs stop at 6 hours; stay under it so a timeout reports
+    # as this step failing rather than the runner being killed.
+    timeout-minutes: 355
+    permissions:
+      checks: read
+    steps:
+      - name: Wait for all checks to pass or be skipped
+        # v0.7.0 checks the latest run for a commit
+        # (poseidon/wait-for-status-checks#627), so a run cancelled by
+        # concurrency, with a successful re-run for the same commit, does not
+        # read as a failure.
+        uses: poseidon/wait-for-status-checks@e7e24423722c5b8e97a6dd5848827d2a412f812d # v0.7.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Itself.  The job sets a name, so it is not ignored automatically,
+          # and a job waiting for its own completion never completes.
+          ignore: "Merge Status"
+          # Do not poll until the sibling workflows have registered their
+          # check runs.  The action treats "every watched run completed" as
+          # satisfied, and an empty set satisfies it vacuously, so a first
+          # poll before any sibling check exists would report success and
+          # gate nothing.  This narrows that window rather than closing it.
+          delay: 60
+          # Build (up to 180 min) -> boot-test (45) -> install-test (60) ->
+          # oce-test (120) can exceed the 6-hour job limit in the worst case;
+          # a green run takes about two hours.  Wait as long as the job limit
+          # allows.
+          timeout: 21000
+          # Long builds: poll once a minute instead of every 10 seconds.
+          interval: 60
