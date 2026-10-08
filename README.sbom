@@ -34,10 +34,23 @@ Structure
 
 The document describes the image itself in ``metadata.component``: its
 release (``LSB_RELEASE_TAG``), the commit it was built from (as a
-``pkg:github/opencomputeproject/onie@<commit>`` package URL), and a
-timestamp taken from ``SOURCE_DATE_EPOCH`` or else that commit's date.  The
-``serialNumber`` is derived from the document's own contents, so two
-identical builds describe themselves identically.
+``pkg:github/<owner>/<name>@<commit>`` package URL), and a timestamp taken
+from ``SOURCE_DATE_EPOCH`` or else that commit's date.  The ``serialNumber``
+is derived from the document's own contents, so two identical builds
+describe themselves identically.
+
+The repository in the package URL is the GitHub remote the current branch
+tracks (else ``origin``), so a build from a fork names the fork the commit
+is in.  Set it explicitly with ``make SBOM_REPOSITORY=<owner>/<name>``.  A
+VEX document names the image by this package URL, so it has to be right.
+
+A tree with uncommitted changes, untracked files included, is not
+described by its commit.  Its SBOM has no package URL, records the commit
+it started from in the ``onie:git-commit`` and ``onie:git-dirty``
+properties, and is stamped with the current time unless
+``SOURCE_DATE_EPOCH`` is set.  Otherwise two different builds from one
+commit would share a build time, and a tool that orders SBOMs by it would
+reject the second as not newer.
 
 The ``dependencies`` graph is rooted at the image, and every component is
 reachable from it::

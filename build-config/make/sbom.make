@@ -45,6 +45,7 @@ $(SBOM_STAMP): $(SYSROOT_COMPLETE_STAMP)
 	         --machine $(MACHINE) \
 	         --make-var MACHINEROOT=$(MACHINEROOT) \
 	         $(if $(MACHINE_REV),--make-var MACHINE_REV=$(MACHINE_REV)) \
+	         $(if $(SBOM_REPOSITORY),--repository $(SBOM_REPOSITORY)) \
 	         --output $(SBOM_CDX) \
 	         --spdx-output $(SBOM_SPDX)
 	$(Q) touch $@

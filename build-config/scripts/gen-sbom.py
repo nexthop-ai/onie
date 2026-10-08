@@ -376,13 +376,49 @@ def git_revision():
         return None
 
 
-def build_timestamp():
+def git_dirty():
+    """True when the tree has uncommitted changes (untracked files count:
+    a machine or patch set added without committing it changes what is
+    built), so HEAD does not describe what was built."""
+    try:
+        return bool(run(["git", "status", "--porcelain"], cwd=ONIE_ROOT).stdout.strip())
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def git_repository():
+    """OWNER/NAME of the GitHub repository HEAD's commit was fetched from:
+    the remote the current branch tracks, else "origin", else the only
+    remote.  None when that is not a GitHub repository."""
+    def out(*cmd):
+        try:
+            return run(["git"] + list(cmd), cwd=ONIE_ROOT).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            return ""
+    remote = out("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    remote = remote.split("/", 1)[0] if "/" in remote else ""
+    if not remote:
+        remotes = out("remote").split()
+        remote = "origin" if "origin" in remotes else (
+            remotes[0] if len(remotes) == 1 else "")
+    url = out("remote", "get-url", remote) if remote else ""
+    m = re.match(r"(?:https?://|ssh://)?(?:[^@/]+@)?github\.com[:/]"
+                 r"([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    return "%s/%s" % m.groups() if m else None
+
+
+def build_timestamp(dirty):
     """When the image's sources were made, so a rebuild is not a new date:
-    SOURCE_DATE_EPOCH if set, else the commit's date, else now."""
+    SOURCE_DATE_EPOCH if set, else the commit's date, else now.  A dirty
+    tree is not described by the commit, so it uses now: two different
+    builds from one commit must not share a build time, or anything that
+    orders SBOMs by it takes the later one for a repeat of the first."""
     import datetime
     sde = os.environ.get("SOURCE_DATE_EPOCH")
     if sde and sde.isdigit():
         t = datetime.datetime.fromtimestamp(int(sde), datetime.timezone.utc)
+    elif dirty:
+        t = datetime.datetime.now(datetime.timezone.utc)
     else:
         try:
             t = datetime.datetime.fromtimestamp(int(run(
@@ -400,6 +436,9 @@ def main():
     ap.add_argument("--spdx-output", help="also emit SPDX 2.3 JSON here (cyclonedx-cli)")
     ap.add_argument("--make-var", action="append", default=[], metavar="NAME=VALUE",
                     help="pass to every make query, e.g. MACHINEROOT=../machine/<vendor>")
+    ap.add_argument("--repository", metavar="OWNER/NAME",
+                    help="GitHub repository the commit is in, for the root purl "
+                         "(default: derived from the git remote)")
     args = ap.parse_args()
     MAKE_VARS.extend(args.make_var)
 
@@ -493,9 +532,18 @@ def main():
             "name": "onie-%s" % args.machine}
     if release:
         root["version"] = release
+    # The purl names the commit, and is what a VEX document matches the
+    # image by, so it is left out when it would point at the wrong thing: a
+    # dirty tree (the commit is not what was built) or no known repository.
     rev = git_revision()
+    dirty = git_dirty()
+    repo = args.repository or git_repository()
+    if rev and repo and not dirty:
+        root["purl"] = "pkg:github/%s@%s" % (repo, rev)
     if rev:
-        root["purl"] = "pkg:github/opencomputeproject/onie@%s" % rev
+        root["properties"] = [{"name": "onie:git-commit", "value": rev},
+                              {"name": "onie:git-dirty",
+                               "value": "true" if dirty else "false"}]
     rootfs = {"type": "operating-system", "bom-ref": "onie-rootfs",
               "name": "onie-rootfs",
               "description": "The ONIE initramfs root filesystem"}
@@ -522,7 +570,7 @@ def main():
         "specVersion": "1.6",
         "version": 1,
         "metadata": {
-            "timestamp": build_timestamp(),
+            "timestamp": build_timestamp(dirty),
             "component": root,
             "tools": [{"name": "gen-sbom.py", "vendor": "ONIE"}],
         },
